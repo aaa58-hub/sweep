@@ -22,13 +22,42 @@ from pathlib import Path
 
 import keyring
 import keyring.errors
+import msal
+import msal_extensions
 
 APP = "Sweep"
 STATE_FILE = Path(os.environ.get("APPDATA", Path.home())) / APP / "state.json"
-HOSTS = {  # provider -> (imap host, smtp host); both implicit TLS (993 / 465)
-    "gmail": ("imap.gmail.com", "smtp.gmail.com"),
-    "libero": ("imapmail.libero.it", "smtp.libero.it"),
+HOSTS = {  # provider -> (imap host on 993 with TLS, smtp host, smtp port: 465 implicit TLS, 587 STARTTLS)
+    "gmail": ("imap.gmail.com", "smtp.gmail.com", 465),
+    "libero": ("imapmail.libero.it", "smtp.libero.it", 465),
+    "outlook": ("imap-mail.outlook.com", "smtp-mail.outlook.com", 587),
+    "yahoo": ("imap.mail.yahoo.com", "smtp.mail.yahoo.com", 465),
+    "icloud": ("imap.mail.me.com", "smtp.mail.me.com", 587),
+    "virgilio": ("in.virgilio.it", "out.virgilio.it", 465),
+    "tiscali": ("imap.tiscali.it", "smtp.tiscali.it", 465),
 }
+DOMAINS = {
+    "gmail": ("gmail.com", "googlemail.com"),
+    "libero": ("libero.it", "inwind.it", "iol.it", "blu.it", "giallo.it"),
+    "outlook": ("outlook.com", "outlook.it", "hotmail.com", "hotmail.it", "live.com", "live.it", "msn.com"),
+    "yahoo": ("yahoo.com", "yahoo.it", "ymail.com", "rocketmail.com"),
+    "icloud": ("icloud.com", "me.com", "mac.com"),
+    "virgilio": ("virgilio.it",),
+    "tiscali": ("tiscali.it",),
+}
+LOGIN_HELP = {
+    "gmail": "Gmail needs an App Password, not your normal password: turn on 2-Step Verification, "
+             "then create one at myaccount.google.com/apppasswords.",
+    "yahoo": "Yahoo needs an App Password: create one in Account security → Generate app password.",
+    "icloud": "iCloud needs an app-specific password: create one at account.apple.com → Sign-In and Security.",
+    "virgilio": "Virgilio needs its 'Password Sicura' for email programs, created in the webmail settings.",
+    "outlook": "Check that IMAP is on in Outlook.com → Settings → Mail → Forwarding and IMAP.",
+}
+# Outlook.com refuses passwords over IMAP/SMTP: it signs in with Microsoft (OAuth2) instead.
+# Client ID of the "Sweep" app registered in Microsoft Entra (personal accounts, public client, redirect http://localhost).
+MS_CLIENT_ID = os.environ.get("SWEEP_MS_CLIENT_ID", "")
+MS_SIGNIN_SECONDS = 300  # give up waiting for the browser sign-in (tab closed) after this
+MS_SCOPES = ["https://outlook.office.com/IMAP.AccessAsUser.All", "https://outlook.office.com/SMTP.Send"]
 MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()  # IMAP dates must be English
 FIELDS = ("(UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST"
           " FEEDBACK-ID LIST-ID PRECEDENCE)])")
@@ -173,18 +202,33 @@ def libero_category(flags):
 
 def guess_provider(addr):
     domain = addr.rsplit("@", 1)[-1].lower()
-    if domain in ("gmail.com", "googlemail.com"):
-        return "gmail"
-    if domain in ("libero.it", "inwind.it", "iol.it", "blu.it", "giallo.it"):
-        return "libero"
-    return None
+    return next((p for p, domains in DOMAINS.items() if domain in domains), None)
 
 
 def friendly_login_error(provider, err):
-    if provider == "gmail":
-        return ("Gmail refused the login. Gmail needs an App Password, not your normal password: "
-                "turn on 2-Step Verification, then create one at myaccount.google.com/apppasswords.")
-    return f"Libero refused the login ({err}). Check the password and that IMAP access is enabled for the mailbox."
+    return f"The mail server refused the login ({err}). " + LOGIN_HELP.get(
+        provider, "Check the password and that access from email programs (IMAP) is enabled for the mailbox.")
+
+
+def xoauth2(addr, token):
+    """SASL XOAUTH2 string; imaplib and smtplib base64 it themselves."""
+    return f"user={addr}\x01auth=Bearer {token}\x01\x01"
+
+
+def imap_login(m, provider, addr, secret):
+    """secret is a password, or a Microsoft access token for Outlook."""
+    if provider == "outlook":
+        m.authenticate("XOAUTH2", lambda challenge: b"" if challenge else xoauth2(addr, secret).encode())
+    else:
+        m.login(addr, secret)
+
+
+def smtp_login(s, provider, addr, secret):
+    if provider == "outlook":  # on failure the server sends a JSON challenge: answer empty to get the error
+        s.ehlo()  # auth(), unlike login(), doesn't redo the EHLO that STARTTLS wiped
+        s.auth("XOAUTH2", lambda challenge=None: "" if challenge else xoauth2(addr, secret))
+    else:
+        s.login(addr, secret)
 
 
 class Api:
@@ -195,6 +239,7 @@ class Api:
         self._found = {}  # key -> (account, [(method, target), ...] best first)
         self._imap = {}  # account -> IMAP session reused while unsubscribing
         self._smtp_next = {}  # account -> monotonic time the next unsubscribe email may go out
+        self._ms = None  # Microsoft sign-in, created on first use
         try:
             self._state = json.loads(STATE_FILE.read_text("utf-8"))
         except (OSError, ValueError):
@@ -207,13 +252,45 @@ class Api:
         STATE_FILE.write_text(json.dumps(self._state, indent=2), "utf-8")
 
     def _account(self, addr):
-        acct = next(a for a in self._state["accounts"] if a["email"] == addr)
-        return acct["provider"], keyring.get_password(APP, addr)
+        """-> (provider, secret): the stored password, or a fresh Microsoft access token for Outlook."""
+        provider = next(a for a in self._state["accounts"] if a["email"] == addr)["provider"]
+        return provider, self._ms_token(addr) if provider == "outlook" else keyring.get_password(APP, addr)
+
+    def _ms_app(self):
+        if not MS_CLIENT_ID:
+            raise RuntimeError("this copy of Sweep has no Microsoft client ID, so it cannot sign in to Outlook (see README)")
+        if not self._ms:
+            # refresh tokens live in a file encrypted for this Windows user (DPAPI): too big for Credential Manager
+            cache = msal_extensions.PersistedTokenCache(msal_extensions.build_encrypted_persistence(
+                str(STATE_FILE.with_name("microsoft_tokens.bin"))))
+            self._ms = msal.PublicClientApplication(MS_CLIENT_ID, authority="https://login.microsoftonline.com/consumers",
+                                                    token_cache=cache)
+        return self._ms
+
+    def _ms_token(self, addr, interactive=False):
+        """Access token for addr, refreshed silently; interactive opens Microsoft's sign-in page in the browser."""
+        app = self._ms_app()
+        known = [a for a in app.get_accounts() if a.get("username", "").lower() == addr]
+        r = app.acquire_token_silent(MS_SCOPES, account=known[0]) if known else None
+        if not r and interactive:
+            r = app.acquire_token_interactive(MS_SCOPES, login_hint=addr, prompt="select_account", timeout=MS_SIGNIN_SECONDS)
+            if "access_token" not in r:
+                raise RuntimeError(f"Microsoft sign-in did not finish ({r.get('error_description') or r.get('error')})")
+            who = str((r.get("id_token_claims") or {}).get("preferred_username", "")).lower()
+            if who != addr:
+                for a in app.get_accounts(username=who):
+                    app.remove_account(a)
+                raise RuntimeError(f"you signed in to Microsoft as {who or 'another account'}, not {addr}")
+        if not r or "access_token" not in r:
+            detail = (r or {}).get("error_description", "").splitlines()[0:1]
+            raise RuntimeError("Microsoft sign-in needed: remove the account and add it again"
+                               + (f" ({detail[0]})" if detail else ""))
+        return r["access_token"]
 
     def _connect(self, addr):
-        provider, password = self._account(addr)
+        provider, secret = self._account(addr)
         m = imaplib.IMAP4_SSL(HOSTS[provider][0], timeout=60)
-        m.login(addr, password)
+        imap_login(m, provider, addr, secret)
         return provider, m
 
     def _progress(self, payload):
@@ -240,21 +317,28 @@ class Api:
     def add_account(self, addr, password, provider):
         addr = addr.strip().lower()
         if provider not in HOSTS:
-            return {"error": "Choose Gmail or Libero."}
+            return {"error": "Choose your email provider."}
         try:
+            secret = self._ms_token(addr, interactive=True) if provider == "outlook" else password
             with imaplib.IMAP4_SSL(HOSTS[provider][0], timeout=30) as m:
-                m.login(addr, password)
+                imap_login(m, provider, addr, secret)
         except imaplib.IMAP4.error as e:
             return {"error": friendly_login_error(provider, e)}
         except OSError as e:
             return {"error": f"Could not reach the mail server: {e}"}
-        keyring.set_password(APP, addr, password)
+        except RuntimeError as e:  # Microsoft sign-in
+            return {"error": f"{str(e)[:1].upper()}{str(e)[1:]}."}
+        if provider != "outlook":
+            keyring.set_password(APP, addr, password)
         self._state["accounts"] = [a for a in self._state["accounts"] if a["email"] != addr]
         self._state["accounts"].append({"email": addr, "provider": provider})
         self._save()
         return {"ok": True, "accounts": self._state["accounts"]}
 
     def remove_account(self, addr):
+        if any(a["email"] == addr and a["provider"] == "outlook" for a in self._state["accounts"]) and MS_CLIENT_ID:
+            for a in self._ms_app().get_accounts(username=addr):  # forget its Microsoft tokens too
+                self._ms_app().remove_account(a)
         self._state["accounts"] = [a for a in self._state["accounts"] if a["email"] != addr]
         self._save()
         try:
@@ -407,13 +491,17 @@ class Api:
         if wait > 60:
             raise RuntimeError("the mail server asked Sweep to slow down, so unsubscribe emails are paused for a few minutes")
         time.sleep(max(wait, 0))
-        provider, password = self._account(account)
+        provider, secret = self._account(account)
         msg = EmailMessage()
         msg["From"], msg["To"], msg["Subject"] = account, to, subject
         msg.set_content(body)
+        host, port, tls = *HOSTS[provider][1:], ssl.create_default_context()
         try:
-            with smtplib.SMTP_SSL(HOSTS[provider][1], 465, context=ssl.create_default_context(), timeout=30) as s:
-                s.login(account, password)
+            with (smtplib.SMTP_SSL(host, port, context=tls, timeout=30) if port == 465
+                  else smtplib.SMTP(host, port, timeout=30)) as s:
+                if port != 465:
+                    s.starttls(context=tls)
+                smtp_login(s, provider, account, secret)
                 s.send_message(msg)
         except (smtplib.SMTPResponseException, smtplib.SMTPRecipientsRefused) as e:
             if "too many" in str(e).lower():  # "too many requests" / "too many invalid recipients": back off

@@ -181,10 +181,15 @@ footer p { margin: 0; font-size: var(--text-sm); color: var(--color-ink-2); }
     <label>Provider
       <select id="f-provider" required>
         <option value="gmail">Gmail</option>
+        <option value="outlook">Outlook / Hotmail</option>
+        <option value="yahoo">Yahoo Mail</option>
+        <option value="icloud">iCloud Mail</option>
         <option value="libero">Libero Mail</option>
+        <option value="virgilio">Virgilio Mail</option>
+        <option value="tiscali">Tiscali Mail</option>
       </select>
     </label>
-    <label><span id="pw-label">App Password</span> <input type="password" id="f-password" required></label>
+    <label id="pw-box"><span id="pw-label">App Password</span> <input type="password" id="f-password" required></label>
     <p class="hint" id="pw-hint"></p>
     <p class="error" id="add-error" role="alert"></p>
     <button class="btn ghost" id="add-btn">Add account</button>
@@ -204,7 +209,7 @@ footer p { margin: 0; font-size: var(--text-sm); color: var(--color-ink-2); }
 </aside>
 
 <main>
-  <p class="summary" id="summary">Add a Gmail or Libero account, then scan. Sweep reads every folder, including Spam and Trash, and never deletes or changes anything.</p>
+  <p class="summary" id="summary">Add an email account, then scan. Sweep reads every folder, including Spam and Trash, and never deletes or changes anything.</p>
   <div class="tools" id="tools" hidden>
     <label class="check"><input type="checkbox" id="all"> Select all shown</label>
     <input type="search" id="filter" placeholder="Filter by name or address" aria-label="Filter senders">
@@ -238,9 +243,15 @@ const METHOD = { "one-click": "One click", mailto: "Sends an email", link: "Open
 const CAT = { promotions: "Promotions / Offerte", newsletter: "Newsletter", social: "Social", forums: "Forums", updates: "Updates",
   orders: "Orders / Ordini", bookings: "Bookings / Prenotazioni", utilities: "Bills / Utenze", primary: "Primary / Principale" };
 const STATUS = { done: "Unsubscribed", browser: "Finish on the website", failed: "Failed", working: "Working…" };
-const HINT = {
-  gmail: 'Gmail needs an App Password, not your usual one. Turn on 2-Step Verification, then <a href="https://myaccount.google.com/apppasswords" target="_blank">create an App Password</a>.',
-  libero: 'Use your Libero Mail password. If the login is refused, check in Libero’s settings that access from email programs (IMAP) is allowed.',
+// provider -> [name on the account, password label ("" = no password: Microsoft sign-in), hint]
+const PROVIDER = {
+  gmail: ["Gmail", "App Password", 'Gmail needs an App Password, not your usual one. Turn on 2-Step Verification, then <a href="https://myaccount.google.com/apppasswords" target="_blank">create an App Password</a>.'],
+  outlook: ["Outlook", "", "Outlook, Hotmail and Live no longer accept passwords from email programs. Adding the account opens Microsoft’s sign-in page in your browser."],
+  yahoo: ["Yahoo", "App Password", 'Yahoo needs an App Password: in <a href="https://login.yahoo.com/account/security" target="_blank">Account security</a>, choose Generate app password.'],
+  icloud: ["iCloud", "App-specific password", 'iCloud needs an app-specific password: create one at <a href="https://account.apple.com" target="_blank">account.apple.com</a> → Sign-In and Security.'],
+  libero: ["Libero", "Password", "Use your Libero Mail password. If the login is refused, check in Libero’s settings that access from email programs (IMAP) is allowed."],
+  virgilio: ["Virgilio", "Password Sicura", "Virgilio needs its “Password Sicura” for email programs, created in the webmail settings."],
+  tiscali: ["Tiscali", "Password", "Use your Tiscali Mail password. If the login is refused, check that access from email programs (IMAP) is allowed."],
 };
 let api, senders = [], accounts = [], selected = new Set(), confirmArmed = false, lastDays = "90";
 const fmt = n => n.toLocaleString("en-GB");
@@ -254,8 +265,11 @@ window.onProgress = p => {
 
 function setProvider(p) {
   $("f-provider").value = p;
-  $("pw-label").textContent = p === "gmail" ? "App Password" : "Password";
-  $("pw-hint").innerHTML = HINT[p];
+  const [, label, hint] = PROVIDER[p];
+  $("pw-label").textContent = label;
+  $("pw-box").hidden = !label; $("f-password").required = !!label;
+  $("pw-hint").innerHTML = hint;
+  $("add-btn").textContent = label ? "Add account" : "Sign in with Microsoft";
 }
 
 function renderAccounts(list) {
@@ -264,7 +278,7 @@ function renderAccounts(list) {
   ul.replaceChildren(...accounts.map(a => {
     const li = document.createElement("li");
     const addr = Object.assign(document.createElement("span"), { className: "addr", textContent: a.email, title: a.email });
-    const prov = Object.assign(document.createElement("span"), { className: "prov", textContent: a.provider === "gmail" ? "Gmail" : "Libero" });
+    const prov = Object.assign(document.createElement("span"), { className: "prov", textContent: (PROVIDER[a.provider] || [a.provider])[0] });
     const rm = Object.assign(document.createElement("button"), { className: "link-btn", textContent: "Remove", type: "button" });
     rm.setAttribute("aria-label", `Remove ${a.email}`);
     rm.onclick = async () => { renderAccounts(await api.remove_account(a.email)); fillAccountFilter(); if (senders.length) renderList(); };
@@ -367,9 +381,10 @@ $("f-provider").addEventListener("change", e => setProvider(e.target.value));
 $("add").addEventListener("submit", async e => {
   e.preventDefault();
   const btn = $("add-btn");
-  btn.disabled = true; btn.textContent = "Checking login…"; $("add-error").textContent = "";
+  const label = btn.textContent, ms = $("f-provider").value === "outlook";
+  btn.disabled = true; btn.textContent = ms ? "Finish signing in in your browser…" : "Checking login…"; $("add-error").textContent = "";
   const r = await api.add_account($("f-email").value, $("f-password").value, $("f-provider").value);
-  btn.disabled = false; btn.textContent = "Add account";
+  btn.disabled = false; btn.textContent = label;
   if (r.error) { $("add-error").textContent = r.error; return; }
   $("add").reset(); setProvider("gmail"); renderAccounts(r.accounts);
 });

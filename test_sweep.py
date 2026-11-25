@@ -1,7 +1,8 @@
 """Run: python test_sweep.py"""
 import smtplib
 
-from app import Api, describe_error, find_unsub_link, gmail_categories, libero_category, list_folders, parse_mailto, parse_unsub, safe_url
+from app import (Api, describe_error, find_unsub_link, gmail_categories, guess_provider, libero_category, list_folders,
+                 parse_mailto, parse_unsub, safe_url)
 
 # one-click first when the Post header says so, then mailto, then the web link as fallbacks
 assert parse_unsub("<mailto:u@x.com>, <https://x.com/u?id=1>", "List-Unsubscribe=One-Click") == [
@@ -149,6 +150,26 @@ for expected in (smtplib.SMTPRecipientsRefused, RuntimeError):
     except expected:
         pass
 app.smtplib.SMTP_SSL = real_smtp
+
+# providers: domains -> provider; Outlook sends over STARTTLS (587) and signs in with an XOAUTH2 token, not a password
+assert [guess_provider(a) for a in ("x@Hotmail.it", "x@live.com", "x@me.com", "x@ymail.com", "x@virgilio.it", "x@ditta.it")] ==     ["outlook", "outlook", "icloud", "yahoo", "virgilio", None]
+seen = []
+
+
+class FakeTLS(FakeSMTP):
+    def __init__(self, host, port, **k): seen.append((host, port))
+    def starttls(self, **k): seen.append("starttls")
+    def ehlo(self): seen.append("ehlo")
+    def auth(self, mech, obj): seen.append((mech, obj(), obj(b'{"status":"400"}')))
+    def send_message(self, msg): seen.append(msg["From"])
+
+
+app.smtplib.SMTP, real_plain = FakeTLS, app.smtplib.SMTP
+api._smtp_next, api._account = {}, lambda a: ("outlook", "tok")
+assert api._send_mail("me@hotmail.it", "mailto:u@x.it") == "done"
+assert seen == [("smtp-mail.outlook.com", 587), "starttls", "ehlo",
+                ("XOAUTH2", "user=me@hotmail.itauth=Bearer tok", ""), "me@hotmail.it"]
+app.smtplib.SMTP = real_plain
 
 # no header, Primary tab, but a mass-mail marker (AliExpress): kept only if its newest email has a real unsubscribe link
 senders = {}

@@ -1,2 +1,4 @@
 pywebview>=6.2
 keyring>=25
+msal>=1.28
+msal-extensions>=1.2
