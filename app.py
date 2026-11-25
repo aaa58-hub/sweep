@@ -55,7 +55,7 @@ LOGIN_HELP = {
 }
 # Outlook.com refuses passwords over IMAP/SMTP: it signs in with Microsoft (OAuth2) instead.
 # Client ID of the "Sweep" app registered in Microsoft Entra (personal accounts, public client, redirect http://localhost).
-MS_CLIENT_ID = os.environ.get("SWEEP_MS_CLIENT_ID", "")
+MS_CLIENT_ID = os.environ.get("SWEEP_MS_CLIENT_ID", "c07c1302-c803-4614-ae1a-613ce9d3c8b9")
 MS_SIGNIN_SECONDS = 300  # give up waiting for the browser sign-in (tab closed) after this
 MS_SCOPES = ["https://outlook.office.com/IMAP.AccessAsUser.All", "https://outlook.office.com/SMTP.Send"]
 MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()  # IMAP dates must be English
